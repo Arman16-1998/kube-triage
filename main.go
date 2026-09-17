@@ -7,15 +7,10 @@ import (
 	"strings"
 )
 
-func runKubectl(args ...string) string {
+func runKubectl(args ...string) (string, error) {
 	cmd := exec.Command("kubectl", args...)
-
 	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Sprintf("ERROR: %v\n%s", err, string(output))
-	}
-
-	return string(output)
+	return string(output), err
 }
 
 func main() {
@@ -52,7 +47,6 @@ func main() {
 			if namespaceSet {
 				failUsage("Error: namespace was specified more than once.")
 			}
-
 			if i+1 >= len(os.Args) {
 				failUsage("Error: namespace option requires a value.")
 			}
@@ -64,7 +58,6 @@ func main() {
 				strings.HasPrefix(namespace, "-") {
 				failUsage("Error: namespace option requires a value.")
 			}
-
 			namespaceSet = true
 
 		default:
@@ -80,40 +73,65 @@ func main() {
 	fmt.Println("\nPOD STATUS")
 	fmt.Println("----------")
 
-	status := runKubectl(
+	status, err := runKubectl(
 		"get", "pod", pod,
 		"-n", namespace,
 		"-o", "wide",
 	)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR: failed to retrieve pod:", err)
+		if status != "" {
+			fmt.Fprintln(os.Stderr, strings.TrimSpace(status))
+		}
+		os.Exit(1)
+	}
 	fmt.Println(status)
 
-	fmt.Println("\nPOD EVENTS")
-	fmt.Println("----------")
+	failed := false
 
-	events := runKubectl(
+	printSection := func(title string, optional bool, args ...string) {
+		fmt.Println("\n" + title)
+		fmt.Println(strings.Repeat("-", len(title)))
+
+		output, err := runKubectl(args...)
+		if err != nil {
+			if optional {
+				fmt.Fprintln(os.Stderr,
+					"WARNING: optional diagnostic unavailable:", err)
+			} else {
+				fmt.Fprintln(os.Stderr,
+					"ERROR: diagnostic collection failed:", err)
+				failed = true
+			}
+
+			if output != "" {
+				fmt.Fprintln(os.Stderr, strings.TrimSpace(output))
+			}
+			return
+		}
+
+		fmt.Println(output)
+	}
+
+	printSection(
+		"POD EVENTS", false,
 		"get", "events",
 		"-n", namespace,
 		"--field-selector", "involvedObject.kind=Pod,involvedObject.name="+pod,
 		"--sort-by=.metadata.creationTimestamp",
 	)
-	fmt.Println(events)
 
-	fmt.Println("\nPOD LOGS")
-	fmt.Println("--------")
-
-	logs := runKubectl(
+	printSection(
+		"POD LOGS", false,
 		"logs", pod,
 		"-n", namespace,
 		"--all-containers=true",
 		"--tail=50",
 		"--timestamps=true",
 	)
-	fmt.Println(logs)
 
-	fmt.Println("\nPREVIOUS CONTAINER LOGS")
-	fmt.Println("-----------------------")
-
-	previousLogs := runKubectl(
+	printSection(
+		"PREVIOUS CONTAINER LOGS", true,
 		"logs", pod,
 		"-n", namespace,
 		"--all-containers=true",
@@ -121,14 +139,14 @@ func main() {
 		"--tail=50",
 		"--timestamps=true",
 	)
-	fmt.Println(previousLogs)
 
-	fmt.Println("\nPOD DETAILS")
-	fmt.Println("-----------")
-
-	details := runKubectl(
+	printSection(
+		"POD DETAILS", false,
 		"describe", "pod", pod,
 		"-n", namespace,
 	)
-	fmt.Println(details)
+
+	if failed {
+		os.Exit(1)
+	}
 }
