@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 func runKubectl(args ...string) string {
@@ -18,17 +19,56 @@ func runKubectl(args ...string) string {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: kube-triage <pod> -n <namespace>")
+	usage := "Usage: kube-triage <pod> [-n <namespace>]"
+
+	failUsage := func(message string) {
+		fmt.Fprintln(os.Stderr, message)
+		fmt.Fprintln(os.Stderr, usage)
+		os.Exit(2)
+	}
+
+	if len(os.Args) == 2 &&
+		(os.Args[1] == "--help" || os.Args[1] == "-h") {
+		fmt.Println(usage)
 		return
+	}
+
+	if len(os.Args) < 2 {
+		failUsage("Error: pod name is required.")
 	}
 
 	pod := os.Args[1]
 	namespace := "default"
 
+	if strings.TrimSpace(pod) == "" || strings.HasPrefix(pod, "-") {
+		failUsage("Error: provide a pod name before any options.")
+	}
+
+	namespaceSet := false
+
 	for i := 2; i < len(os.Args); i++ {
-		if os.Args[i] == "-n" && i+1 < len(os.Args) {
-			namespace = os.Args[i+1]
+		switch os.Args[i] {
+		case "-n", "--namespace":
+			if namespaceSet {
+				failUsage("Error: namespace was specified more than once.")
+			}
+
+			if i+1 >= len(os.Args) {
+				failUsage("Error: namespace option requires a value.")
+			}
+
+			i++
+			namespace = os.Args[i]
+
+			if strings.TrimSpace(namespace) == "" ||
+				strings.HasPrefix(namespace, "-") {
+				failUsage("Error: namespace option requires a value.")
+			}
+
+			namespaceSet = true
+
+		default:
+			failUsage("Error: unexpected argument: " + os.Args[i])
 		}
 	}
 
@@ -41,15 +81,10 @@ func main() {
 	fmt.Println("----------")
 
 	status := runKubectl(
-		"get",
-		"pod",
-		pod,
-		"-n",
-		namespace,
-		"-o",
-		"wide",
+		"get", "pod", pod,
+		"-n", namespace,
+		"-o", "wide",
 	)
-
 	fmt.Println(status)
 
 	fmt.Println("\nPOD EVENTS")
@@ -87,6 +122,7 @@ func main() {
 		"--timestamps=true",
 	)
 	fmt.Println(previousLogs)
+
 	fmt.Println("\nPOD DETAILS")
 	fmt.Println("-----------")
 
