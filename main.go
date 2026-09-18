@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -12,31 +13,61 @@ import (
 
 const commandTimeout = 30 * time.Second
 
+type termination struct {
+	Reason   string `json:"reason"`
+	ExitCode int32  `json:"exitCode"`
+}
+
+type containerState struct {
+	Waiting *struct {
+		Reason string `json:"reason"`
+	} `json:"waiting"`
+	Running    *struct{}    `json:"running"`
+	Terminated *termination `json:"terminated"`
+}
+
+type containerStatus struct {
+	Name         string         `json:"name"`
+	Ready        bool           `json:"ready"`
+	RestartCount int32          `json:"restartCount"`
+	State        containerState `json:"state"`
+	LastState    containerState `json:"lastState"`
+}
+
 type PodInfo struct {
 	Status struct {
-		Phase             string `json:"phase"`
-		ContainerStatuses []struct {
-			Name         string `json:"name"`
-			Ready        bool   `json:"ready"`
-			RestartCount int32  `json:"restartCount"`
-			State        struct {
-				Waiting *struct {
-					Reason string `json:"reason"`
-				} `json:"waiting"`
-				Running    *struct{} `json:"running"`
-				Terminated *struct {
-					Reason   string `json:"reason"`
-					ExitCode int32  `json:"exitCode"`
-				} `json:"terminated"`
-			} `json:"state"`
-			LastState struct {
-				Terminated *struct {
-					Reason   string `json:"reason"`
-					ExitCode int32  `json:"exitCode"`
-				} `json:"terminated"`
-			} `json:"lastState"`
-		} `json:"containerStatuses"`
+		Phase             string            `json:"phase"`
+		ContainerStatuses []containerStatus `json:"containerStatuses"`
 	} `json:"status"`
+}
+
+// reportWriter sends each message to the terminal and, optionally, a file.
+// It remembers write errors so an incomplete export cannot report success.
+type reportWriter struct {
+	file *os.File
+	err  error
+}
+
+func (r *reportWriter) write(terminal io.Writer, values ...any) {
+	message := fmt.Sprintln(values...)
+
+	if _, err := io.WriteString(terminal, message); err != nil && r.err == nil {
+		r.err = err
+	}
+
+	if r.file != nil {
+		if _, err := io.WriteString(r.file, message); err != nil && r.err == nil {
+			r.err = err
+		}
+	}
+}
+
+func (r *reportWriter) println(values ...any) {
+	r.write(os.Stdout, values...)
+}
+
+func (r *reportWriter) errorln(values ...any) {
+	r.write(os.Stderr, values...)
 }
 
 func runKubectl(args ...string) (string, error) {
@@ -44,6 +75,8 @@ func runKubectl(args ...string) (string, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "kubectl", args...)
+	cmd.WaitDelay = 2 * time.Second
+
 	output, err := cmd.CombinedOutput()
 
 	if ctx.Err() == context.DeadlineExceeded {
@@ -55,9 +88,9 @@ func runKubectl(args ...string) (string, error) {
 	return string(output), err
 }
 
-func printSummary(pod, namespace string) error {
-	fmt.Println("\nSUMMARY")
-	fmt.Println("-------")
+func printSummary(report *reportWriter, pod, namespace string) error {
+	report.println("\nSUMMARY")
+	report.println("-------")
 
 	output, err := runKubectl(
 		"get", "pod", pod,
@@ -76,17 +109,17 @@ func printSummary(pod, namespace string) error {
 		return fmt.Errorf("parse pod information: %w", err)
 	}
 
-	fmt.Println("Phase:", info.Status.Phase)
+	report.println("Phase:", info.Status.Phase)
 
 	if len(info.Status.ContainerStatuses) == 0 {
-		fmt.Println("No container status available yet; review pod events.")
+		report.println("No container status available yet; review pod events.")
 		return nil
 	}
 
 	for _, container := range info.Status.ContainerStatuses {
-		fmt.Println("\nContainer:", container.Name)
-		fmt.Println("Ready:", container.Ready)
-		fmt.Println("Restarts:", container.RestartCount)
+		report.println("\nContainer:", container.Name)
+		report.println("Ready:", container.Ready)
+		report.println("Restarts:", container.RestartCount)
 
 		state := "Unknown"
 		lastExitCode := int32(-1)
@@ -114,16 +147,16 @@ func printSummary(pod, namespace string) error {
 			lastReason = container.LastState.Terminated.Reason
 		}
 
-		fmt.Println("State:", state)
+		report.println("State:", state)
 
 		if lastExitCode >= 0 {
-			fmt.Println("Last exit code:", lastExitCode)
+			report.println("Last exit code:", lastExitCode)
 		}
 		if lastReason != "" {
-			fmt.Println("Last reason:", lastReason)
+			report.println("Last reason:", lastReason)
 		}
 
-		fmt.Println("Suggested check:", suggestionFor(
+		report.println("Suggested check:", suggestionFor(
 			state,
 			lastReason,
 			container.RestartCount,
@@ -177,66 +210,14 @@ func suggestionFor(state, lastReason string, restarts int32, ready bool) string 
 	return "Review pod events, logs, and pod details to investigate the container state."
 }
 
-func main() {
-	usage := "Usage: kube-triage <pod> [-n <namespace>]"
+func collectReport(report *reportWriter, pod, namespace string) int {
+	report.println("KUBE TRIAGE")
+	report.println("===========")
+	report.println("Pod:", pod)
+	report.println("Namespace:", namespace)
 
-	failUsage := func(message string) {
-		fmt.Fprintln(os.Stderr, message)
-		fmt.Fprintln(os.Stderr, usage)
-		os.Exit(2)
-	}
-
-	if len(os.Args) == 2 &&
-		(os.Args[1] == "--help" || os.Args[1] == "-h") {
-		fmt.Println(usage)
-		return
-	}
-
-	if len(os.Args) < 2 {
-		failUsage("Error: pod name is required.")
-	}
-
-	pod := os.Args[1]
-	namespace := "default"
-
-	if strings.TrimSpace(pod) == "" || strings.HasPrefix(pod, "-") {
-		failUsage("Error: provide a pod name before any options.")
-	}
-
-	namespaceSet := false
-
-	for i := 2; i < len(os.Args); i++ {
-		switch os.Args[i] {
-		case "-n", "--namespace":
-			if namespaceSet {
-				failUsage("Error: namespace was specified more than once.")
-			}
-			if i+1 >= len(os.Args) {
-				failUsage("Error: namespace option requires a value.")
-			}
-
-			i++
-			namespace = os.Args[i]
-
-			if strings.TrimSpace(namespace) == "" ||
-				strings.HasPrefix(namespace, "-") {
-				failUsage("Error: namespace option requires a value.")
-			}
-
-			namespaceSet = true
-
-		default:
-			failUsage("Error: unexpected argument: " + os.Args[i])
-		}
-	}
-
-	fmt.Println("KUBE TRIAGE")
-	fmt.Println("===========")
-	fmt.Println("Pod:", pod)
-	fmt.Println("Namespace:", namespace)
-
-	fmt.Println("\nPOD STATUS")
-	fmt.Println("----------")
+	report.println("\nPOD STATUS")
+	report.println("----------")
 
 	status, err := runKubectl(
 		"get", "pod", pod,
@@ -244,44 +225,46 @@ func main() {
 		"-o", "wide",
 	)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "ERROR: failed to retrieve pod:", err)
+		report.errorln("ERROR: failed to retrieve pod:", err)
 		if status != "" {
-			fmt.Fprintln(os.Stderr, strings.TrimSpace(status))
+			report.errorln(strings.TrimSpace(status))
 		}
-		os.Exit(1)
+		return 1
 	}
 
-	fmt.Println(status)
+	report.println(status)
 
 	failed := false
 
-	if err := printSummary(pod, namespace); err != nil {
-		fmt.Fprintln(os.Stderr, "ERROR: summary failed:", err)
+	if err := printSummary(report, pod, namespace); err != nil {
+		report.errorln("ERROR: summary failed:", err)
 		failed = true
 	}
 
 	printSection := func(title string, optional bool, args ...string) {
-		fmt.Println("\n" + title)
-		fmt.Println(strings.Repeat("-", len(title)))
+		report.println("\n" + title)
+		report.println(strings.Repeat("-", len(title)))
 
 		output, err := runKubectl(args...)
 		if err != nil {
 			if optional {
-				fmt.Fprintln(os.Stderr,
-					"WARNING: optional diagnostic unavailable:", err)
+				report.errorln(
+					"WARNING: optional diagnostic unavailable:", err,
+				)
 			} else {
-				fmt.Fprintln(os.Stderr,
-					"ERROR: diagnostic collection failed:", err)
+				report.errorln(
+					"ERROR: diagnostic collection failed:", err,
+				)
 				failed = true
 			}
 
 			if output != "" {
-				fmt.Fprintln(os.Stderr, strings.TrimSpace(output))
+				report.errorln(strings.TrimSpace(output))
 			}
 			return
 		}
 
-		fmt.Println(output)
+		report.println(output)
 	}
 
 	printSection(
@@ -318,6 +301,110 @@ func main() {
 	)
 
 	if failed {
-		os.Exit(1)
+		return 1
 	}
+	return 0
+}
+
+func run(args []string) int {
+	usage := "Usage: kube-triage <pod> [-n <namespace>] [--output <file>]"
+
+	failUsage := func(message string) int {
+		fmt.Fprintln(os.Stderr, message)
+		fmt.Fprintln(os.Stderr, usage)
+		return 2
+	}
+
+	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
+		fmt.Println(usage)
+		return 0
+	}
+
+	if len(args) == 0 {
+		return failUsage("Error: pod name is required.")
+	}
+
+	pod := args[0]
+	namespace := "default"
+	outputPath := ""
+
+	if strings.TrimSpace(pod) == "" || strings.HasPrefix(pod, "-") {
+		return failUsage("Error: provide a pod name before any options.")
+	}
+
+	namespaceSet := false
+	outputSet := false
+
+	for i := 1; i < len(args); i++ {
+		option := args[i]
+
+		switch option {
+		case "-n", "--namespace", "--output":
+			if i+1 >= len(args) {
+				return failUsage("Error: " + option + " requires a value.")
+			}
+
+			i++
+			value := args[i]
+
+			if strings.TrimSpace(value) == "" || strings.HasPrefix(value, "-") {
+				return failUsage("Error: " + option + " requires a value.")
+			}
+
+			if option == "--output" {
+				if outputSet {
+					return failUsage("Error: output was specified more than once.")
+				}
+				outputPath = value
+				outputSet = true
+			} else {
+				if namespaceSet {
+					return failUsage("Error: namespace was specified more than once.")
+				}
+				namespace = value
+				namespaceSet = true
+			}
+
+		default:
+			return failUsage("Error: unexpected argument: " + option)
+		}
+	}
+
+	report := &reportWriter{}
+
+	if outputSet {
+		file, err := os.OpenFile(
+			outputPath,
+			os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+			0600,
+		)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ERROR: cannot create report file:", err)
+			return 1
+		}
+		report.file = file
+	}
+
+	exitCode := collectReport(report, pod, namespace)
+
+	if report.file != nil {
+		if err := report.file.Close(); err != nil && report.err == nil {
+			report.err = err
+		}
+	}
+
+	if report.err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR: could not fully write report:", report.err)
+		return 1
+	}
+
+	if outputSet {
+		fmt.Fprintln(os.Stderr, "Report saved to:", outputPath)
+	}
+
+	return exitCode
+}
+
+func main() {
+	os.Exit(run(os.Args[1:]))
 }
