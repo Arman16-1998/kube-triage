@@ -55,35 +55,32 @@ func runKubectl(args ...string) (string, error) {
 	return string(output), err
 }
 
-func printSummary(pod, namespace string) {
+func printSummary(pod, namespace string) error {
+	fmt.Println("\nSUMMARY")
+	fmt.Println("-------")
+
 	output, err := runKubectl(
 		"get", "pod", pod,
 		"-n", namespace,
 		"-o", "json",
 	)
 	if err != nil {
-		fmt.Println("\nSUMMARY")
-		fmt.Println("-------")
-		fmt.Println("Unable to generate structured summary.")
-		return
+		return fmt.Errorf(
+			"retrieve pod information: %w\n%s",
+			err, strings.TrimSpace(output),
+		)
 	}
 
 	var info PodInfo
-
 	if err := json.Unmarshal([]byte(output), &info); err != nil {
-		fmt.Println("\nSUMMARY")
-		fmt.Println("-------")
-		fmt.Println("Unable to parse pod information.")
-		return
+		return fmt.Errorf("parse pod information: %w", err)
 	}
 
-	fmt.Println("\nSUMMARY")
-	fmt.Println("-------")
 	fmt.Println("Phase:", info.Status.Phase)
 
 	if len(info.Status.ContainerStatuses) == 0 {
-		fmt.Println("No container status available.")
-		return
+		fmt.Println("No container status available yet; review pod events.")
+		return nil
 	}
 
 	for _, container := range info.Status.ContainerStatuses {
@@ -97,15 +94,22 @@ func printSummary(pod, namespace string) {
 
 		if container.State.Waiting != nil {
 			state = container.State.Waiting.Reason
+			if state == "" {
+				state = "Waiting"
+			}
 		} else if container.State.Running != nil {
 			state = "Running"
 		} else if container.State.Terminated != nil {
 			state = container.State.Terminated.Reason
+			if state == "" {
+				state = "Terminated"
+			}
 			lastExitCode = container.State.Terminated.ExitCode
 			lastReason = container.State.Terminated.Reason
 		}
 
-		if container.LastState.Terminated != nil {
+		if container.State.Terminated == nil &&
+			container.LastState.Terminated != nil {
 			lastExitCode = container.LastState.Terminated.ExitCode
 			lastReason = container.LastState.Terminated.Reason
 		}
@@ -115,7 +119,6 @@ func printSummary(pod, namespace string) {
 		if lastExitCode >= 0 {
 			fmt.Println("Last exit code:", lastExitCode)
 		}
-
 		if lastReason != "" {
 			fmt.Println("Last reason:", lastReason)
 		}
@@ -124,39 +127,54 @@ func printSummary(pod, namespace string) {
 			state,
 			lastReason,
 			container.RestartCount,
+			container.Ready,
 		))
 	}
+
+	return nil
 }
 
-func suggestionFor(state, lastReason string, restarts int32) string {
-	combined := strings.ToLower(state + " " + lastReason)
-
-	switch {
-	case strings.Contains(combined, "oomkilled"):
-		return "Check container memory usage and memory limits."
-
-	case strings.Contains(combined, "imagepullbackoff"),
-		strings.Contains(combined, "errimagepull"):
+func suggestionFor(state, lastReason string, restarts int32, ready bool) string {
+	switch strings.ToLower(state) {
+	case "imagepullbackoff", "errimagepull":
 		return "Check the image name, registry access, and image pull credentials."
 
-	case strings.Contains(combined, "crashloopbackoff"):
-		return "Review application logs and startup configuration."
-
-	case strings.Contains(combined, "createcontainerconfigerror"):
+	case "createcontainerconfigerror":
 		return "Check ConfigMaps, Secrets, environment variables, and volume configuration."
 
-	case strings.Contains(combined, "containercannotrun"):
+	case "containercannotrun":
 		return "Check the container command, entrypoint, permissions, and image compatibility."
 
-	case restarts >= 5:
-		return "High restart count detected; review current and previous container logs."
+	case "oomkilled":
+		return "Check container memory usage, memory limits, and node memory pressure."
 
-	case strings.EqualFold(state, "Running"):
-		return "No obvious container failure state detected."
+	case "crashloopbackoff":
+		if strings.EqualFold(lastReason, "OOMKilled") {
+			return "Last termination was OOMKilled; check memory usage, limits, and node memory pressure."
+		}
+		return "Review application logs and startup configuration."
 
-	default:
-		return "Review pod events, logs, and pod details for the failure cause."
+	case "completed":
+		return "Container completed; confirm this is expected for the workload."
 	}
+
+	if strings.EqualFold(state, "Running") && !ready {
+		return "Container is running but not ready; check readiness and startup probes, logs, and dependencies."
+	}
+
+	if strings.EqualFold(lastReason, "OOMKilled") {
+		return "A recorded termination was OOMKilled; review memory usage, limits, and node memory pressure."
+	}
+
+	if restarts >= 5 {
+		return "High restart count detected; review current and previous container logs."
+	}
+
+	if strings.EqualFold(state, "Running") && ready {
+		return "Container is running and ready; review any historical restarts separately."
+	}
+
+	return "Review pod events, logs, and pod details to investigate the container state."
 }
 
 func main() {
@@ -204,6 +222,7 @@ func main() {
 				strings.HasPrefix(namespace, "-") {
 				failUsage("Error: namespace option requires a value.")
 			}
+
 			namespaceSet = true
 
 		default:
@@ -234,9 +253,12 @@ func main() {
 
 	fmt.Println(status)
 
-	printSummary(pod, namespace)
-
 	failed := false
+
+	if err := printSummary(pod, namespace); err != nil {
+		fmt.Fprintln(os.Stderr, "ERROR: summary failed:", err)
+		failed = true
+	}
 
 	printSection := func(title string, optional bool, args ...string) {
 		fmt.Println("\n" + title)
