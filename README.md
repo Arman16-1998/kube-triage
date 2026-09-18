@@ -5,14 +5,13 @@ A Go command-line tool that collects and summarizes Kubernetes pod diagnostics u
 ## Features
 
 - Pod status and node placement
-- Automatic diagnostic summary
+- Structured diagnostic summary
 - Container readiness and restart counts
-- CrashLoopBackOff detection
-- OOMKilled detection
-- Image pull error detection
+- Current and latest recorded termination details
+- Suggestions for common container failure states
 - Current and previous container logs, with timestamps
 - Pod events ordered by creation time
-- Pod details, including exit codes and restart counts
+- Detailed pod information
 - 30-second timeout for each `kubectl` command
 - Exit codes suitable for scripts and automation
 
@@ -20,7 +19,9 @@ A Go command-line tool that collects and summarizes Kubernetes pod diagnostics u
 
 - Go matching `go.mod`, or automatic toolchain downloads enabled
 - `kubectl` available on `PATH`
-- A configured Kubernetes context with permission to read pod diagnostics
+- A configured Kubernetes context with permission to read pods, events, and pod logs
+
+Run the tool in the same environment where `kubectl` can access your cluster.
 
 ## Build
 
@@ -31,10 +32,10 @@ go build -o kube-triage .
 ## Usage
 
 ```bash
-./kube-triage <pod> -n <namespace>
+./kube-triage <pod> [-n <namespace>]
 ```
 
-The namespace defaults to `default`.
+The namespace defaults to `default`. Both `-n` and `--namespace` are supported after the pod name.
 
 Example:
 
@@ -64,11 +65,13 @@ Last reason: Error
 Suggested check: Review application logs and startup configuration.
 ```
 
-The pod phase and container state are reported separately. For example, Kubernetes may report a pod phase of `Running` while a container is in `CrashLoopBackOff`.
+Pod phase and container state are reported separately. A pod can have phase `Running` while a container is in `CrashLoopBackOff`.
+
+When a container is currently terminated, its current termination details take precedence over an older termination. Otherwise, the summary uses the previous termination details when available.
 
 ## Diagnostic suggestions
 
-`kube-triage` currently provides basic suggestions for several common failure states:
+The tool provides basic suggestions for:
 
 - `CrashLoopBackOff`
 - `OOMKilled`
@@ -76,15 +79,19 @@ The pod phase and container state are reported separately. For example, Kubernet
 - `ErrImagePull`
 - `CreateContainerConfigError`
 - `ContainerCannotRun`
-- High container restart counts
+- Running containers that are not ready
+- Completed containers
+- High restart counts of five or more
 
-Suggestions are based on Kubernetes state information and are intended to guide investigation, not provide definitive root-cause analysis.
+Suggestions are based on reported container state and termination history. They guide investigation and do not establish a definitive root cause.
+
+The summary currently covers regular containers only.
 
 ## Command timeout
 
-Every `kubectl` command is limited to 30 seconds.
+Each `kubectl` command has a 30-second timeout.
 
-If the Kubernetes API or a diagnostic command does not respond within that time, `kube-triage` reports a timeout instead of hanging indefinitely.
+The timeout applies separately to each command, not to the entire report. Diagnostic commands run sequentially, so a complete report can take longer than 30 seconds.
 
 Example:
 
@@ -92,59 +99,48 @@ Example:
 ERROR: failed to retrieve pod: kubectl timed out after 30s
 ```
 
-## Windows and WSL
+A timeout during the initial pod lookup stops the report. Timeouts in later required diagnostics mark the run as failed while allowing the remaining sections to run.
 
-Tested in Ubuntu on WSL2 using Docker and a local `kind` cluster.
-
-Windows project path:
-
-```text
-C:\kube-triage
-```
-
-WSL project path:
-
-```text
-/mnt/c/kube-triage
-```
-
-Run Linux build and test commands inside WSL.
-
-The executable built inside WSL is a Linux binary.
-
-Windows and WSL have separate tool installations and Kubernetes configurations.
-
-## Limitations
-
-- Requires `kubectl`
-- Logs are limited to the last 50 lines per container
-- Previous container logs may be unavailable
-- Historical warnings do not necessarily indicate a current problem
-- Pod state may change between diagnostic sections
-- Suggestions are heuristic and do not guarantee the root cause
-- Multi-container pod selection is not yet supported
+Previous container logs are optional.
 
 ## Exit codes
 
-- `0`: Diagnostics collected successfully. This does not mean the pod is healthy.
-- `1`: Pod lookup or a required diagnostic command failed.
-- `2`: Invalid command arguments.
+| Code | Meaning |
+|------|---------|
+| `0` | Required diagnostics collected successfully. This does not mean the pod is healthy. |
+| `1` | Pod lookup, summary retrieval/parsing, or a required diagnostic command failed. |
+| `2` | Invalid command arguments. |
 
 A failed pod lookup stops the report immediately.
 
-Other required diagnostic failures allow the remaining sections to finish.
+A summary failure or another required diagnostic failure allows the remaining sections to finish, then returns exit code `1`.
 
-Previous logs are optional: failure produces a warning without changing the exit code.
+If the previous-log command returns an error, the tool prints a warning without changing the exit code.
+
+A pod with no regular container statuses yet produces an informational summary message, rather than a summary error.
 
 ## Help
-
-Use:
 
 ```bash
 ./kube-triage --help
 ```
 
-to display usage.
+The `-h` option is also supported.
+
+## Windows and WSL
+
+Tested inside Ubuntu on WSL2 using Docker and a local `kind` cluster.
+
+The same project folder is accessible at:
+
+- Windows: `C:\kube-triage`
+- Ubuntu on WSL: `/mnt/c/kube-triage`
+
+Run the Linux build and usage commands inside WSL. An executable built there is a Linux binary.
+
+Windows and WSL have separate tool installations and Kubernetes configurations.
+
+After changing `main.go`, rebuild the executable before running it.
 
 ## WSL build troubleshooting
 
@@ -154,10 +150,29 @@ If building fails with:
 error obtaining VCS status
 ```
 
-use:
+build with:
 
 ```bash
 go build -buildvcs=false -o kube-triage .
 ```
 
 This disables Git metadata embedding in the executable.
+
+For running directly from source with the same workaround:
+
+```bash
+go run -buildvcs=false . triage-crash -n default
+```
+
+## Limitations
+
+- Requires `kubectl`; does not call the Kubernetes API directly
+- Logs are limited to the last 50 lines per container
+- Previous container logs may be unavailable
+- Historical warning events do not necessarily indicate a current problem
+- Pod state may change between diagnostic sections
+- Suggestions do not guarantee the root cause
+- Summarizes regular containers and requests their logs; selecting one container is not yet supported
+- Init containers and ephemeral containers are not included in the summary
+- Successful diagnostic collection does not mean the workload is healthy
+- Command failure detection relies on the exit status returned by `kubectl`; error-like text returned with exit status `0` is displayed without being classified as a failure
